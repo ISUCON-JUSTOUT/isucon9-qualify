@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -1059,6 +1060,7 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	eg, ctx := errgroup.WithContext(context.Background())
+	var mu sync.RWMutex
 	ctx, cancel := context.WithCancel(ctx)
 	ssrMap := make(map[int64]APIShipmentStatusRes)
 
@@ -1119,7 +1121,7 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 				case <-ctx.Done():
 					return nil
 				default:
-			ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
+					ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
 						ReserveID: rid,
 					})
 					if err != nil {
@@ -1129,6 +1131,8 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 						// tx.Rollback()
 						// return
 					}
+					mu.Lock()
+					defer mu.Unlock()
 					ssrMap[iid] = *ssr
 					return nil
 				}
