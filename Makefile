@@ -38,8 +38,8 @@ set-ssh:
 # git configとssh 設定
 git-config:
 	# githubの設定
-	@git config --global user.name "Tatsuemon"
-	@git config --global user.email "i10mann-110@ezweb.ne.jp"
+	@git config --global user.name "yuyafukuchi"
+	@git config --global user.email "yuya3542@yahoo.co.jp"
 
 	# ssh Hostの設定
 	@echo "
