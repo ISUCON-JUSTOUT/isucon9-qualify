@@ -931,10 +931,12 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 	// categoryを検索する
 	var userIDs []int64
 	var categoryIDs []int
+	var itemIDs []int64
 	for _, item := range items {
 		// TODO: uniqueなら追加するとかできたらする？？
 		userIDs = append(userIDs, item.SellerID, item.BuyerID)
 		categoryIDs = append(categoryIDs, item.CategoryID)
+		itemIDs = append(itemIDs, item.ID)
 	}
 	// {id: user}
 	userIDMap := make(map[int64]UserSimple, len(userIDs))
@@ -972,6 +974,24 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 				CategoryName:       category.CategoryName,
 				ParentCategoryName: pcn,
 			}
+		}
+	}
+
+	type Tes struct {
+		ID        int64  `json:"id" db:"id"`
+		ItemID    int64  `json:"item_id" db:"item_id"`
+		Status    string `json:"status" db:"status"`
+		ReserveID string `json:"reserve_id" db:"reserve_id"`
+	}
+
+	tesMap := make(map[int64]Tes, len(itemIDs))
+	if len(itemIDs) > 0 {
+		query, params, _ := sqlx.In("SELECT t1.`id` as `id`, t1.`item_id` as `item_id`, t1.`status` as `status`, s1.`reserve_id` as `reserve_id` FROM `transaction_evidences` as t1 JOIN `shippings` as s1 ON t1.`id` = s1.`transaction_evidence_id` WHERE t1.`item_id` IN (?)", itemIDs)
+		var teses []Tes
+		tx.Select(&teses, query, params...)
+
+		for _, tes := range teses {
+			tesMap[tes.ItemID] = tes
 		}
 	}
 
@@ -1021,24 +1041,8 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			itemDetail.Buyer = &buyer
 		}
 
-		type Tes struct {
-			ID        int64  `json:"id" db:"id"`
-			Status    string `json:"status" db:"status"`
-			ReserveID string `json:"reserve_id" db:"reserve_id"`
-		}
-
-		tes := Tes{}
-		err := tx.Get(&tes, "SELECT t1.`id` as `id`, t1.`status` as `status`, s1.`reserve_id` as `reserve_id` FROM `transaction_evidences` as t1 JOIN `shippings` as s1 ON t1.`id` = s1.`transaction_evidence_id` WHERE t1.`item_id` = ?", item.ID)
-
-		if err != nil && err != sql.ErrNoRows {
-			// It's able to ignore ErrNoRows
-			log.Print(err)
-			outputErrorMsg(w, http.StatusInternalServerError, "db error")
-			tx.Rollback()
-			return
-		}
-
-		if tes.ID > 0 {
+		tes, ok := tesMap[item.ID]
+		if ok {
 			ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
 				ReserveID: tes.ReserveID,
 			})
