@@ -600,10 +600,30 @@ func getNewItems(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var userIDs []int64
+	for _, item := range items {
+		// TODO: uniqueなら追加するとかできたらする？？
+		userIDs = append(userIDs, item.SellerID)
+	}
+	// {id: user}
+	userIDMap := make(map[int64]UserSimple, len(userIDs))
+	if len(userIDs) > 0 {
+		query, params, _ := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", userIDs)
+		var users []User
+		dbx.Select(&users, query, params...)
+		for _, user := range users {
+			userIDMap[user.ID] = UserSimple{
+				ID:           user.ID,
+				AccountName:  user.AccountName,
+				NumSellItems: user.NumSellItems,
+			}
+		}
+	}
+
 	itemSimples := []ItemSimple{}
 	for _, item := range items {
-		seller, err := getUserSimpleByID(dbx, item.SellerID)
-		if err != nil {
+		seller, ok := userIDMap[item.SellerID]
+		if !ok {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			return
 		}
@@ -656,6 +676,8 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var categoryIDs []int
+
+	// TODO: category
 	err = dbx.Select(&categoryIDs, "SELECT id FROM `categories` WHERE parent_id=?", rootCategory.ID)
 	if err != nil {
 		log.Print(err)
