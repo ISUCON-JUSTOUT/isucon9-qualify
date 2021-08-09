@@ -397,7 +397,7 @@ func main() {
 	mux.HandleFunc(pat.Get("/users/:user_id"), getIndex)
 	mux.HandleFunc(pat.Get("/users/setting"), getIndex)
 	// Assets
-	mux.Handle(pat.Get("/*"), http.FileServer(http.Dir("../public")))
+	// mux.Handle(pat.Get("/*"), http.FileServer(http.Dir("../public")))
 	log.Fatal(http.ListenAndServe(":8000", mux))
 }
 
@@ -1696,6 +1696,7 @@ func postShip(w http.ResponseWriter, r *http.Request) {
 		Path:      fmt.Sprintf("/transactions/%d.png", transactionEvidence.ID),
 		ReserveID: shipping.ReserveID,
 	}
+	w.Header().Set("Content-Type", "application/json;charset=utf-8")
 	json.NewEncoder(w).Encode(rps)
 }
 
