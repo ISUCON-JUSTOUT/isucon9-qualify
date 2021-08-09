@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	crand "crypto/rand"
 	"database/sql"
 	"encoding/json"
@@ -23,6 +24,7 @@ import (
 	goji "goji.io"
 	"goji.io/pat"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/sync/errgroup"
 
 	_ "net/http/pprof"
 )
@@ -1056,6 +1058,10 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	eg, ctx := errgroup.WithContext(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
+	ssrMap := make(map[int64]APIShipmentStatusRes)
+
 	for _, item := range items {
 		// 売り手のユーザーを検索する
 		seller, ok := userIDMap[item.SellerID]
@@ -1103,21 +1109,57 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		tes, ok := tesMap[item.ID]
+		itemDetail.TransactionEvidenceID = tes.ID
+		itemDetail.TransactionEvidenceStatus = tes.Status
 		if ok {
+			iid := item.ID
+			rid := tes.ReserveID
+			eg.Go(func() error {
+				select {
+				case <-ctx.Done():
+					return nil
+				default:
 			ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
-				ReserveID: tes.ReserveID,
-			})
-			if err != nil {
-				log.Print(err)
-				outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
-				tx.Rollback()
-				return
-			}
+						ReserveID: rid,
+					})
+					if err != nil {
+						return err
+						// log.Print(err)
+						// outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
+						// tx.Rollback()
+						// return
+					}
+					ssrMap[iid] = *ssr
+					return nil
+				}
+				// })
+				// wg.Add(1)
+				// go func(itemID int64, rID string) {
+				// 	defer wg.Done()
 
-			itemDetail.TransactionEvidenceID = tes.ID
-			itemDetail.TransactionEvidenceStatus = tes.Status
-			itemDetail.ShippingStatus = ssr.Status
+				// if err != nil {
+				// 		log.Print(err)
+				// 		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
+				// 		tx.Rollback()
+				// return
+				// }
+				// return nil
+			})
 		}
+		itemDetails = append(itemDetails, itemDetail)
+	}
+
+	if err := eg.Wait(); err != nil {
+		log.Print(err)
+		cancel()
+		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
+		tx.Rollback()
+		return
+	}
+
+	for i, item := range itemDetails {
+		itemDetails[i].ShippingStatus = ssrMap[item.ID].Status
+	}
 
 		itemDetails = append(itemDetails, itemDetail)
 	}
