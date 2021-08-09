@@ -4,6 +4,7 @@ import (
 	crand "crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/ioutil"
@@ -271,6 +272,9 @@ type resSetting struct {
 	Categories        []Category `json:"categories"`
 }
 
+// categoryをin-memoryで管理
+var CategoryByIDMap map[int]Category
+
 func init() {
 	store = sessions.NewCookieStore([]byte("abc"))
 
@@ -331,6 +335,28 @@ func main() {
 	}
 	defer dbx.Close()
 
+	var categories []Category
+	err = sqlx.Select(dbx, &categories, "SELECT * FROM `categories`")
+	if err != nil {
+		log.Fatalf("failes to get categories: %s", err.Error())
+	}
+
+	CategoryByIDMap = make(map[int]Category, len(categories))
+	for _, category := range categories {
+		CategoryByIDMap[category.ID] = category
+	}
+	for _, category := range categories {
+		if category.ParentID == 0 {
+			continue
+		}
+		pc, ok := CategoryByIDMap[category.ParentID]
+		if ok {
+			t := category
+			t.ParentCategoryName = pc.CategoryName
+			CategoryByIDMap[category.ID] = t
+		}
+	}
+
 	mux := goji.NewMux()
 
 	// API
@@ -388,13 +414,19 @@ func getCSRFToken(r *http.Request) string {
 	return csrfToken.(string)
 }
 
+// TODO: cache使用できる
+/*
+userを
+SELECT * FROM users WHERE id = ? の結果をキャッシュする
+*/
+
 func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 	session := getSession(r)
 	userID, ok := session.Values["user_id"]
 	if !ok {
 		return user, http.StatusNotFound, "no session"
 	}
-
+	// TODO: cache使用できる
 	err := dbx.Get(&user, "SELECT * FROM `users` WHERE `id` = ?", userID)
 	if err == sql.ErrNoRows {
 		return user, http.StatusNotFound, "user not found"
@@ -409,6 +441,7 @@ func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 
 func getUserSimpleByID(q sqlx.Queryer, userID int64) (userSimple UserSimple, err error) {
 	user := User{}
+	// TODO: cache使用できる
 	err = sqlx.Get(q, &user, "SELECT * FROM `users` WHERE `id` = ?", userID)
 	if err != nil {
 		return userSimple, err
@@ -419,16 +452,13 @@ func getUserSimpleByID(q sqlx.Queryer, userID int64) (userSimple UserSimple, err
 	return userSimple, err
 }
 
+// TODO: cache使用できる <- in-memoryでもいいかもしれない
 func getCategoryByID(q sqlx.Queryer, categoryID int) (category Category, err error) {
-	err = sqlx.Get(q, &category, "SELECT * FROM `categories` WHERE `id` = ?", categoryID)
-	if category.ParentID != 0 {
-		parentCategory, err := getCategoryByID(q, category.ParentID)
-		if err != nil {
-			return category, err
-		}
-		category.ParentCategoryName = parentCategory.CategoryName
+	category, ok := CategoryByIDMap[categoryID]
+	if !ok {
+		return category, errors.New("aaaaaa")
 	}
-	return category, err
+	return category, nil
 }
 
 func getConfigByName(name string) (string, error) {
@@ -1388,7 +1418,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	buyer, errCode, errMsg := getUser(r)
+	buyer, errCode, errMsg := getUser(r) // TODO: 中身の改善
 	if errMsg != "" {
 		outputErrorMsg(w, errCode, errMsg)
 		return
