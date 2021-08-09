@@ -361,6 +361,15 @@ func main() {
 		}
 	}
 
+	// configをmemoryに載せる
+	var configs []Config
+	dbx.Select(&configs, "SELECT * FROM `configs`")
+
+	ConfigByNameMap = make(map[string]Config, len(configs))
+	for _, config := range configs {
+		ConfigByNameMap[config.Name] = config
+	}
+
 	mux := goji.NewMux()
 
 	// API
@@ -466,16 +475,11 @@ func getCategoryByID(q sqlx.Queryer, categoryID int) (category Category, err err
 }
 
 func getConfigByName(name string) (string, error) {
-	config := Config{}
-	err := dbx.Get(&config, "SELECT * FROM `configs` WHERE `name` = ?", name)
-	if err == sql.ErrNoRows {
-		return "", nil
+	config, ok := ConfigByNameMap[name]
+	if !ok {
+		return "", errors.New("config")
 	}
-	if err != nil {
-		log.Print(err)
-		return "", err
-	}
-	return config.Val, err
+	return config.Val, nil
 }
 
 func getPaymentServiceURL() string {
