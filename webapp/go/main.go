@@ -698,15 +698,61 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 売り手のユーザーを検索する, N+1を解決するために, userをInで検索する
+	// categoryを検索する
+	var userIDs []int64
+	for _, item := range items {
+		// TODO: uniqueなら追加するとかできたらする？？
+		userIDs = append(userIDs, item.SellerID)
+	}
+	// {id: user}
+	userIDMap := make(map[int64]UserSimple, len(userIDs))
+	if len(userIDs) > 0 {
+		query, params, _ := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", userIDs)
+		var users []User
+		dbx.Select(&users, query, params...)
+		for _, user := range users {
+			userIDMap[user.ID] = UserSimple{
+				ID:           user.ID,
+				AccountName:  user.AccountName,
+				NumSellItems: user.NumSellItems,
+			}
+		}
+	}
+
+	type CC struct {
+		ID                 int    `json:"id" db:"id"`
+		ParentID           int    `json:"parent_id" db:"parent_id"`
+		CategoryName       string `json:"category_name" db:"category_name"`
+		ParentCategoryName string `json:"parent_category_name,omitempty" db:"parent_category_name"`
+	}
+
+	categoryIDMap := make(map[int]Category, len(categoryIDs))
+	if len(categoryIDs) > 0 {
+		query, params, _ := sqlx.In("SELECT c1.`id` as id, c1.`parent_id` as parent_id, c1.`category_name` as category_name, c2.`category_name` as parent_category_name FROM `categories` as c1 JOIN `categories` as c2 ON c1.`parent_id` = c2.`id` WHERE c1.`id` IN (?)", categoryIDs)
+		var categories []CC
+		dbx.Select(&categories, query, params...)
+
+		for _, category := range categories {
+			pcn := category.ParentCategoryName
+			categoryIDMap[category.ID] = Category{
+				ID:                 category.ID,
+				ParentID:           category.ParentID,
+				CategoryName:       category.CategoryName,
+				ParentCategoryName: pcn,
+			}
+		}
+	}
+
 	itemSimples := []ItemSimple{}
 	for _, item := range items {
-		seller, err := getUserSimpleByID(dbx, item.SellerID)
-		if err != nil {
+		seller, ok := userIDMap[item.SellerID]
+		if !ok {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			return
 		}
-		category, err := getCategoryByID(dbx, item.CategoryID)
-		if err != nil {
+		category, ok := categoryIDMap[item.CategoryID]
+		if !ok {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			return
 		}
