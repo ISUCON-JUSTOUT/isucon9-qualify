@@ -275,6 +275,9 @@ type resSetting struct {
 // categoryをin-memoryで管理
 var CategoryByIDMap map[int]Category
 
+// configをin-memoryで管理
+var ConfigByNameMap map[string]Config
+
 func init() {
 	store = sessions.NewCookieStore([]byte("abc"))
 
