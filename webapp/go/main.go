@@ -335,6 +335,7 @@ func main() {
 	}
 	defer dbx.Close()
 
+	// categoryをmemoryに載せる
 	var categories []Category
 	err = sqlx.Select(dbx, &categories, "SELECT * FROM `categories`")
 	if err != nil {
@@ -750,30 +751,6 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	type CC struct {
-		ID                 int    `json:"id" db:"id"`
-		ParentID           int    `json:"parent_id" db:"parent_id"`
-		CategoryName       string `json:"category_name" db:"category_name"`
-		ParentCategoryName string `json:"parent_category_name,omitempty" db:"parent_category_name"`
-	}
-
-	categoryIDMap := make(map[int]Category, len(categoryIDs))
-	if len(categoryIDs) > 0 {
-		query, params, _ := sqlx.In("SELECT c1.`id` as id, c1.`parent_id` as parent_id, c1.`category_name` as category_name, c2.`category_name` as parent_category_name FROM `categories` as c1 JOIN `categories` as c2 ON c1.`parent_id` = c2.`id` WHERE c1.`id` IN (?)", categoryIDs)
-		var categories []CC
-		dbx.Select(&categories, query, params...)
-
-		for _, category := range categories {
-			pcn := category.ParentCategoryName
-			categoryIDMap[category.ID] = Category{
-				ID:                 category.ID,
-				ParentID:           category.ParentID,
-				CategoryName:       category.CategoryName,
-				ParentCategoryName: pcn,
-			}
-		}
-	}
-
 	itemSimples := []ItemSimple{}
 	for _, item := range items {
 		seller, ok := userIDMap[item.SellerID]
@@ -781,7 +758,7 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			return
 		}
-		category, ok := categoryIDMap[item.CategoryID]
+		category, ok := CategoryByIDMap[item.CategoryID]
 		if !ok {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			return
@@ -1006,12 +983,10 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 	// 売り手のユーザーを検索する, N+1を解決するために, userをInで検索する
 	// categoryを検索する
 	var userIDs []int64
-	var categoryIDs []int
 	var itemIDs []int64
 	for _, item := range items {
 		// TODO: uniqueなら追加するとかできたらする？？
 		userIDs = append(userIDs, item.SellerID, item.BuyerID)
-		categoryIDs = append(categoryIDs, item.CategoryID)
 		itemIDs = append(itemIDs, item.ID)
 	}
 	// {id: user}
@@ -1025,30 +1000,6 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 				ID:           user.ID,
 				AccountName:  user.AccountName,
 				NumSellItems: user.NumSellItems,
-			}
-		}
-	}
-
-	type CC struct {
-		ID                 int    `json:"id" db:"id"`
-		ParentID           int    `json:"parent_id" db:"parent_id"`
-		CategoryName       string `json:"category_name" db:"category_name"`
-		ParentCategoryName string `json:"parent_category_name,omitempty" db:"parent_category_name"`
-	}
-
-	categoryIDMap := make(map[int]Category, len(categoryIDs))
-	if len(categoryIDs) > 0 {
-		query, params, _ := sqlx.In("SELECT c1.`id` as id, c1.`parent_id` as parent_id, c1.`category_name` as category_name, c2.`category_name` as parent_category_name FROM `categories` as c1 JOIN `categories` as c2 ON c1.`parent_id` = c2.`id` WHERE c1.`id` IN (?)", categoryIDs)
-		var categories []CC
-		tx.Select(&categories, query, params...)
-
-		for _, category := range categories {
-			pcn := category.ParentCategoryName
-			categoryIDMap[category.ID] = Category{
-				ID:                 category.ID,
-				ParentID:           category.ParentID,
-				CategoryName:       category.CategoryName,
-				ParentCategoryName: pcn,
 			}
 		}
 	}
@@ -1080,7 +1031,7 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		category, ok := categoryIDMap[item.CategoryID]
+		category, ok := CategoryByIDMap[item.CategoryID]
 		if !ok {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			tx.Rollback()
