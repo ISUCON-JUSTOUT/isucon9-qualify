@@ -1021,8 +1021,17 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			itemDetail.Buyer = &buyer
 		}
 
-		transactionEvidence := TransactionEvidence{}
-		err = tx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", item.ID)
+		type Tes struct {
+			ID        int64  `json:"id" db:"id"`
+			Status    string `json:"status" db:"status"`
+			ReserveID string `json:"reserve_id" db:"reserve_id"`
+		}
+
+		tes := Tes{}
+		err := tx.Get(&tes, "SELECT t1.`id` as `id`, t1.`status` as `status`, s1.`reserve_id` as `reserve_id` FROM `transaction_evidences` as t1 JOIN `shippings` as s1 ON t1.`id` = s1.`transaction_evidence_id` WHERE t1.`item_id` = ?", item.ID)
+
+		// transactionEvidence := TransactionEvidence{}
+		// err = tx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", item.ID)
 		if err != nil && err != sql.ErrNoRows {
 			// It's able to ignore ErrNoRows
 			log.Print(err)
@@ -1031,22 +1040,22 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if transactionEvidence.ID > 0 {
-			shipping := Shipping{}
-			err = tx.Get(&shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
-			if err == sql.ErrNoRows {
-				outputErrorMsg(w, http.StatusNotFound, "shipping not found")
-				tx.Rollback()
-				return
-			}
-			if err != nil {
-				log.Print(err)
-				outputErrorMsg(w, http.StatusInternalServerError, "db error")
-				tx.Rollback()
-				return
-			}
+		if tes.ID > 0 {
+			// shipping := Shipping{}
+			// err = tx.Get(&shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
+			// if err == sql.ErrNoRows {
+			// 	outputErrorMsg(w, http.StatusNotFound, "shipping not found")
+			// 	tx.Rollback()
+			// 	return
+			// }
+			// if err != nil {
+			// 	log.Print(err)
+			// 	outputErrorMsg(w, http.StatusInternalServerError, "db error")
+			// 	tx.Rollback()
+			// 	return
+			// }
 			ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
-				ReserveID: shipping.ReserveID,
+				ReserveID: tes.ReserveID,
 			})
 			if err != nil {
 				log.Print(err)
@@ -1055,8 +1064,8 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			itemDetail.TransactionEvidenceID = transactionEvidence.ID
-			itemDetail.TransactionEvidenceStatus = transactionEvidence.Status
+			itemDetail.TransactionEvidenceID = tes.ID
+			itemDetail.TransactionEvidenceStatus = tes.Status
 			itemDetail.ShippingStatus = ssr.Status
 		}
 
