@@ -932,7 +932,8 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 	var userIDs []int64
 	var categoryIDs []int
 	for _, item := range items {
-		userIDs = append(userIDs, item.SellerID)
+		// TODO: uniqueなら追加するとかできたらする？？
+		userIDs = append(userIDs, item.SellerID, item.BuyerID)
 		categoryIDs = append(categoryIDs, item.CategoryID)
 	}
 	// {id: user}
@@ -982,12 +983,6 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			tx.Rollback()
 			return
 		}
-		// category, err := getCategoryByID(tx, item.CategoryID)
-		// if err != nil {
-		// 	outputErrorMsg(w, http.StatusNotFound, "category not found")
-		// 	tx.Rollback()
-		// 	return
-		// }
 
 		category, ok := categoryIDMap[item.CategoryID]
 		if !ok {
@@ -1016,8 +1011,8 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if item.BuyerID != 0 {
-			buyer, err := getUserSimpleByID(tx, item.BuyerID)
-			if err != nil {
+			buyer, ok := userIDMap[item.BuyerID]
+			if !ok {
 				outputErrorMsg(w, http.StatusNotFound, "buyer not found")
 				tx.Rollback()
 				return
