@@ -354,7 +354,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("failes to get categories: %s", err.Error())
 	}
-
 	CategoryByIDMap = make(map[int]Category, len(categories))
 	for _, category := range categories {
 		CategoryByIDMap[category.ID] = category
@@ -1126,28 +1125,12 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 					})
 					if err != nil {
 						return err
-						// log.Print(err)
-						// outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
-						// tx.Rollback()
-						// return
 					}
 					mu.Lock()
 					defer mu.Unlock()
 					ssrMap[iid] = *ssr
 					return nil
 				}
-				// })
-				// wg.Add(1)
-				// go func(itemID int64, rID string) {
-				// 	defer wg.Done()
-
-				// if err != nil {
-				// 		log.Print(err)
-				// 		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
-				// 		tx.Rollback()
-				// return
-				// }
-				// return nil
 			})
 		}
 		itemDetails = append(itemDetails, itemDetail)
@@ -1165,8 +1148,6 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		itemDetails[i].ShippingStatus = ssrMap[item.ID].Status
 	}
 
-		itemDetails = append(itemDetails, itemDetail)
-	}
 	tx.Commit()
 
 	hasNext := false
