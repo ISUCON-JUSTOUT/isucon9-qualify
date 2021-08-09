@@ -341,6 +341,10 @@ func main() {
 	}
 	defer dbx.Close()
 
+	// max connections, idle connsの設定
+	dbx.SetMaxOpenConnns(20)
+	dbx.SetMaxIdleConns(10)
+
 	// categoryをmemoryに載せる
 	var categories []Category
 	err = sqlx.Select(dbx, &categories, "SELECT * FROM `categories`")
