@@ -1,5 +1,13 @@
 export GO111MODULE=on
 
+bench:
+	sudo truncate --size 0 /var/log/nginx/access.log
+	sudo truncate --size 0 /var/log/isucari.log
+	cd webapp/go && make
+	sudo systemctl restart isucari.golang
+	./bin/benchmarker -target-url http://127.0.0.1
+.PHONY: bench
+
 all: bin/benchmarker bin/benchmark-worker bin/payment bin/shipment
 
 bin/benchmarker: cmd/bench/main.go bench/**/*.go
