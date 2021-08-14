@@ -345,8 +345,8 @@ func main() {
 	defer dbx.Close()
 
 	// max connections, idle connsの設定
-	dbx.SetMaxOpenConns(20)
-	dbx.SetMaxIdleConns(10)
+	// dbx.SetMaxOpenConns(20)
+	// dbx.SetMaxIdleConns(10)
 
 	// categoryをmemoryに載せる
 	var categories []Category
