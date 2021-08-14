@@ -27,6 +27,9 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/go-redis/redis/v7"
+	// "github.com/go-redis/cache/v7"
+
 	_ "net/http/pprof"
 )
 
@@ -281,6 +284,11 @@ var CategoryByIDMap map[int]Category
 // configをin-memoryで管理
 var ConfigByNameMap map[string]Config
 
+// redis cli
+var rcli *redis.Client
+// var rc *cache.Cache
+
+
 func init() {
 	store = sessions.NewCookieStore([]byte("abc"))
 
@@ -343,6 +351,14 @@ func main() {
 		log.Fatalf("failed to connect to DB: %s.", err.Error())
 	}
 	defer dbx.Close()
+
+	// redis client
+	rcli = redis.NewClient(&redis.Options{
+		Addr: "127.0.0.1:6379",
+		Password: "",
+		DB: 0,
+	})
+	defer rcli.Close()
 
 	// max connections, idle connsの設定
 	// dbx.SetMaxOpenConns(20)
@@ -449,7 +465,17 @@ func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 		return user, http.StatusNotFound, "no session"
 	}
 	// TODO: cache使用できる
-	err := dbx.Get(&user, "SELECT * FROM `users` WHERE `id` = ?", userID)
+
+	userStr, err := rcli.Get(fmt.Sprintf("%v", userID)).Result()
+	if err == nil {
+		var user User
+		if err := json.Unmarshal([]byte(userStr), &user); err != nil {
+			panic(err)
+		}
+		return user, http.StatusOK, ""
+	}
+
+	err = dbx.Get(&user, "SELECT * FROM `users` WHERE `id` = ?", userID)
 	if err == sql.ErrNoRows {
 		return user, http.StatusNotFound, "user not found"
 	}
@@ -458,16 +484,47 @@ func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 		return user, http.StatusInternalServerError, "db error"
 	}
 
+	s, err := json.Marshal(user)
+	if err != nil {
+		panic(err)
+	}
+
+	if err := rcli.Set(fmt.Sprintf("%v", userID), string(s), 10 * time.Second).Err(); err != nil {
+		log.Fatalf("failed to set data in redis: %s", err)
+	}
+
 	return user, http.StatusOK, ""
 }
 
 func getUserSimpleByID(q sqlx.Queryer, userID int64) (userSimple UserSimple, err error) {
 	user := User{}
 	// TODO: cache使用できる
+	userStr, err := rcli.Get(fmt.Sprintf("%v", userID)).Result()
+	if err == nil {
+		var user User
+		if err := json.Unmarshal([]byte(userStr), &user); err != nil {
+			panic(err)
+		}
+		userSimple.ID = user.ID
+		userSimple.AccountName = user.AccountName
+		userSimple.NumSellItems = user.NumSellItems
+		return userSimple, nil
+	}
+
 	err = sqlx.Get(q, &user, "SELECT * FROM `users` WHERE `id` = ?", userID)
 	if err != nil {
 		return userSimple, err
 	}
+	
+	s, err := json.Marshal(user)
+	if err != nil {
+		panic(err)
+	}
+
+	if err := rcli.Set(fmt.Sprintf("%v", userID), string(s), 10 * time.Second).Err(); err != nil {
+		log.Fatalf("failed to set data in redis: %s", err)
+	}
+
 	userSimple.ID = user.ID
 	userSimple.AccountName = user.AccountName
 	userSimple.NumSellItems = user.NumSellItems
@@ -2192,6 +2249,17 @@ func postSell(w http.ResponseWriter, r *http.Request) {
 	}
 	tx.Commit()
 
+	seller.NumSellItems += 1
+	seller.LastBump = now
+	s, err := json.Marshal(seller)
+	if err != nil {
+		panic(err)
+	}
+
+	if err := rcli.Set(fmt.Sprintf("%v", seller.ID), string(s), 10 * time.Second).Err(); err != nil {
+		log.Fatalf("failed to set data in redis: %s", err)
+	}
+
 	w.Header().Set("Content-Type", "application/json;charset=utf-8")
 	json.NewEncoder(w).Encode(resSell{ID: itemID})
 }
@@ -2300,6 +2368,17 @@ func postBump(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tx.Commit()
+
+	seller.LastBump = now
+	s, err := json.Marshal(seller)
+	if err != nil {
+		panic(err)
+	}
+
+	if err := rcli.Set(fmt.Sprintf("%v", seller.ID), string(s), 10 * time.Second).Err(); err != nil {
+		log.Fatalf("failed to set data in redis: %s", err)
+	}
+
 
 	w.Header().Set("Content-Type", "application/json;charset=utf-8")
 	json.NewEncoder(w).Encode(&resItemEdit{

@@ -26,7 +26,7 @@ staticcheck:
 clean:
 	rm -rf bin/*
 
-PROJECT_NAME=isucon
+PROJECT_NAME=isucon9-qualify
 
 # ssh用の公開鍵をセットする
 set-ssh:
