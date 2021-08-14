@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -63,6 +65,14 @@ var (
 	templates *template.Template
 	dbx       *sqlx.DB
 	store     sessions.Store
+)
+
+// categoryのオンメモリ化
+var (
+	allCategories []Category
+	categoryByID  map[int]Category
+	// getNewCategoryItems()の内部の処理で使う
+	childCategoryIDs map[int][]int
 )
 
 type Config struct {
@@ -145,6 +155,7 @@ type TransactionEvidence struct {
 	ItemRootCategoryID int       `json:"item_root_category_id" db:"item_root_category_id"`
 	CreatedAt          time.Time `json:"-" db:"created_at"`
 	UpdatedAt          time.Time `json:"-" db:"updated_at"`
+	ReserveID          string    `json:"reserve_id" db:"reserve_id"`
 }
 
 type Shipping struct {
@@ -278,6 +289,38 @@ func init() {
 	))
 }
 
+func loadCategories() {
+	err := dbx.Select(&allCategories, "SELECT * FROM categories")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	categoryByID = make(map[int]Category, len(allCategories))
+	for _, category := range allCategories {
+		id := category.ID
+		categoryByID[id] = category
+	}
+
+	// parent の情報を入れる操作
+	for id, category := range categoryByID {
+		if parent, ok := categoryByID[category.ParentID]; ok {
+			category.ParentCategoryName = parent.CategoryName
+			categoryByID[id] = category
+		}
+	}
+
+	childCategoryIDs = make(map[int][]int)
+	for id, category := range categoryByID {
+		if category.ParentID > 0 {
+			if _, ok := childCategoryIDs[category.ParentID]; !ok {
+				childCategoryIDs[category.ParentID] = []int{id}
+			} else {
+				childCategoryIDs[category.ParentID] = append(childCategoryIDs[category.ParentID], id)
+			}
+		}
+	}
+}
+
 func main() {
 	host := os.Getenv("MYSQL_HOST")
 	if host == "" {
@@ -318,7 +361,12 @@ func main() {
 		log.Fatalf("failed to connect to DB: %s.", err.Error())
 	}
 	defer dbx.Close()
+	dbx.SetConnMaxLifetime(10 * time.Second)
+	dbx.SetMaxIdleConns(512)
+	dbx.SetMaxOpenConns(512)
 
+
+	loadCategories()
 	mux := goji.NewMux()
 
 	// API
@@ -407,16 +455,12 @@ func getUserSimpleByID(q sqlx.Queryer, userID int64) (userSimple UserSimple, err
 	return userSimple, err
 }
 
-func getCategoryByID(q sqlx.Queryer, categoryID int) (category Category, err error) {
-	err = sqlx.Get(q, &category, "SELECT * FROM `categories` WHERE `id` = ?", categoryID)
-	if category.ParentID != 0 {
-		parentCategory, err := getCategoryByID(q, category.ParentID)
-		if err != nil {
-			return category, err
-		}
-		category.ParentCategoryName = parentCategory.CategoryName
+func getCategoryByID(categoryID int) (category Category, err error) {
+	category, ok := categoryByID[categoryID]
+	if !ok {
+		return Category{}, sql.ErrNoRows
 	}
-	return category, err
+	return category, nil
 }
 
 func getConfigByName(name string) (string, error) {
@@ -557,14 +601,54 @@ func getNewItems(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	uniItemIDs := make(map[int64]struct{})
+	var sellerIDs []interface{}
+
+	for _, item := range items {
+		id := item.SellerID
+		if _, ok := uniItemIDs[id]; !ok {
+			uniItemIDs[id] = struct{}{}
+			sellerIDs = append(sellerIDs, id)
+		}
+	}
+
+	var userSimples map[int64]UserSimple
+
+	if len(sellerIDs) > 0 {
+		query := "SELECT * FROM users WHERE id IN (?)"
+		query, args, err := sqlx.In(query, sellerIDs)
+		if err != nil {
+			log.Print(err)
+			outputErrorMsg(w, http.StatusInternalServerError, "db error")
+			return
+		}
+
+		var u []User
+		err = dbx.Select(&u, query, args...)
+		if err != nil {
+			log.Print(err)
+			outputErrorMsg(w, http.StatusInternalServerError, "db error")
+			return
+		}
+
+		userSimples = make(map[int64]UserSimple, len(u))
+		for _, usr := range u {
+			userSimples[usr.ID] = UserSimple{
+				ID:           usr.ID,
+				AccountName:  usr.AccountName,
+				NumSellItems: usr.NumSellItems,
+			}
+		}
+	}
+
 	itemSimples := []ItemSimple{}
 	for _, item := range items {
-		seller, err := getUserSimpleByID(dbx, item.SellerID)
-		if err != nil {
+		seller, ok := userSimples[item.SellerID]
+		if !ok {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			return
 		}
-		category, err := getCategoryByID(dbx, item.CategoryID)
+		category, err := getCategoryByID(item.CategoryID)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			return
@@ -606,15 +690,14 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rootCategory, err := getCategoryByID(dbx, rootCategoryID)
+	rootCategory, err := getCategoryByID(rootCategoryID)
 	if err != nil || rootCategory.ParentID != 0 {
 		outputErrorMsg(w, http.StatusNotFound, "category not found")
 		return
 	}
 
-	var categoryIDs []int
-	err = dbx.Select(&categoryIDs, "SELECT id FROM `categories` WHERE parent_id=?", rootCategory.ID)
-	if err != nil {
+	categoryIDs, ok := childCategoryIDs[rootCategory.ID]
+	if !ok {
 		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "db error")
 		return
@@ -678,21 +761,60 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 
 	items := []Item{}
 	err = dbx.Select(&items, inQuery, inArgs...)
-
 	if err != nil {
 		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "db error")
 		return
 	}
 
+	uniItems := make(map[int64]struct{})
+	var sellerIDs []interface{}
+
+	for _, item := range items {
+		id := item.SellerID
+		if _, ok := uniItems[id]; !ok {
+			sellerIDs = append(sellerIDs, id)
+			uniItems[id] = struct{}{}
+		}
+	}
+
+	var userSimples map[int64]UserSimple
+	if len(sellerIDs) > 0 {
+		query := "SELECT * FROM users WHERE id IN (?)"
+
+		query, args, err := sqlx.In(query, sellerIDs)
+		if err != nil {
+			log.Print(err)
+			outputErrorMsg(w, http.StatusInternalServerError, "db error")
+			return
+		}
+
+		var u []User
+		err = dbx.Select(&u, query, args...)
+		if err != nil {
+			log.Print(err)
+			outputErrorMsg(w, http.StatusInternalServerError, "db error")
+			return
+		}
+
+		userSimples = make(map[int64]UserSimple, len(u))
+		for _, usr := range u {
+			userSimples[usr.ID] = UserSimple{
+				ID:           usr.ID,
+				AccountName:  usr.AccountName,
+				NumSellItems: usr.NumSellItems,
+			}
+		}
+	}
+
 	itemSimples := []ItemSimple{}
 	for _, item := range items {
-		seller, err := getUserSimpleByID(dbx, item.SellerID)
-		if err != nil {
+		seller, ok := userSimples[item.SellerID]
+		if !ok {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			return
 		}
-		category, err := getCategoryByID(dbx, item.CategoryID)
+		category, err := getCategoryByID(item.CategoryID)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			return
@@ -802,7 +924,7 @@ func getUserItems(w http.ResponseWriter, r *http.Request) {
 
 	itemSimples := []ItemSimple{}
 	for _, item := range items {
-		category, err := getCategoryByID(dbx, item.CategoryID)
+		category, err := getCategoryByID(item.CategoryID)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			return
@@ -912,15 +1034,119 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	uniUserIDs := make(map[int64]struct{})
+	itemIDs := make([]int64, 0, len(items))
+	var userIDs []interface{}
+
+	for _, item := range items {
+		sellerID := item.SellerID
+		if _, ok := uniUserIDs[sellerID]; !ok {
+			uniUserIDs[sellerID] = struct{}{}
+			userIDs = append(userIDs, sellerID)
+		}
+		buyerID := item.BuyerID
+		if _, ok := uniUserIDs[buyerID]; !ok {
+			uniUserIDs[buyerID] = struct{}{}
+			userIDs = append(userIDs, buyerID)
+		}
+
+		itemIDs = append(itemIDs, item.ID)
+	}
+
+	var userSimples map[int64]UserSimple
+	if len(userIDs) > 0 {
+		query := "SELECT * FROM users WHERE id IN (?)"
+		query, args, err := sqlx.In(query, userIDs)
+		if err != nil {
+			log.Print(err)
+			outputErrorMsg(w, http.StatusInternalServerError, "in query error")
+			return
+		}
+
+		var u []User
+		err = dbx.Select(&u, query, args...)
+		if err != nil {
+			log.Print(err)
+			outputErrorMsg(w, http.StatusInternalServerError, "users db error")
+			return
+		}
+
+		userSimples = make(map[int64]UserSimple, len(u))
+		for _, usr := range u {
+			userSimples[usr.ID] = UserSimple{
+				ID:           usr.ID,
+				AccountName:  usr.AccountName,
+				NumSellItems: usr.NumSellItems,
+			}
+		}
+	}
+
+	var transactionEvidences map[int64]TransactionEvidence
+	if len(itemIDs) > 0 {
+		query, args, err := sqlx.In(
+			"SELECT t.item_id AS item_id, t.status AS status, s.reserve_id AS reserve_id FROM transaction_evidences t LEFT JOIN shippings s ON s.transaction_evidence_id = t.id WHERE t.item_id IN (?)", itemIDs)
+		if err != nil {
+			log.Print(err)
+			outputErrorMsg(w, http.StatusInternalServerError, "db error")
+			return
+		}
+
+		var t []TransactionEvidence
+		err = dbx.Select(&t, query, args...)
+		if err != nil {
+			log.Print(err)
+			outputErrorMsg(w, http.StatusInternalServerError, "db error")
+			return
+		}
+
+		transactionEvidences = make(map[int64]TransactionEvidence, len(t))
+		for _, te := range t {
+			transactionEvidences[te.ItemID] = te
+		}
+	}
+	var wg sync.WaitGroup
+	var shipmentStatuses sync.Map
+	var concurrentError atomic.Value
+	wg.Add(len(transactionEvidences))
+
+	for _, t := range transactionEvidences {
+		go func(t TransactionEvidence) {
+			defer wg.Done()
+			if t.ReserveID == "" {
+				return
+			}
+			ssr, err := APIShipmentStatus(
+				getShipmentServiceURL(),
+				&APIShipmentStatusReq{
+					ReserveID: t.ReserveID,
+				},
+			)
+
+			if err != nil {
+				concurrentError.Store(err)
+				return
+			}
+			shipmentStatuses.Store(t.ItemID, ssr)
+		}(t)
+	}
+	wg.Wait()
+	cerr := concurrentError.Load()
+	if cerr != nil {
+		log.Print(cerr)
+		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
+		tx.Rollback()
+		return
+	}
+
 	itemDetails := []ItemDetail{}
 	for _, item := range items {
-		seller, err := getUserSimpleByID(tx, item.SellerID)
-		if err != nil {
+		seller, ok := userSimples[item.SellerID]
+		if !ok {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			tx.Rollback()
 			return
 		}
-		category, err := getCategoryByID(tx, item.CategoryID)
+		category, err := getCategoryByID(item.CategoryID)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			tx.Rollback()
@@ -947,9 +1173,9 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if item.BuyerID != 0 {
-			buyer, err := getUserSimpleByID(tx, item.BuyerID)
-			if err != nil {
-				outputErrorMsg(w, http.StatusNotFound, "buyer not found")
+			buyer, ok := userSimples[item.BuyerID]
+			if !ok {
+				outputErrorMsg(w, http.StatusNotFound, fmt.Sprint("buyer not found: %+v", buyer))
 				tx.Rollback()
 				return
 			}
@@ -957,43 +1183,18 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			itemDetail.Buyer = &buyer
 		}
 
-		transactionEvidence := TransactionEvidence{}
-		err = tx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", item.ID)
-		if err != nil && err != sql.ErrNoRows {
-			// It's able to ignore ErrNoRows
-			log.Print(err)
-			outputErrorMsg(w, http.StatusInternalServerError, "db error")
-			tx.Rollback()
-			return
-		}
-
-		if transactionEvidence.ID > 0 {
-			shipping := Shipping{}
-			err = tx.Get(&shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
-			if err == sql.ErrNoRows {
+		transactionEvidence, ok := transactionEvidences[item.ID]
+		if ok {
+			ssr, ok := shipmentStatuses.Load(item.ID)
+			if !ok {
 				outputErrorMsg(w, http.StatusNotFound, "shipping not found")
-				tx.Rollback()
-				return
-			}
-			if err != nil {
-				log.Print(err)
-				outputErrorMsg(w, http.StatusInternalServerError, "db error")
-				tx.Rollback()
-				return
-			}
-			ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
-				ReserveID: shipping.ReserveID,
-			})
-			if err != nil {
-				log.Print(err)
-				outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
 				tx.Rollback()
 				return
 			}
 
 			itemDetail.TransactionEvidenceID = transactionEvidence.ID
 			itemDetail.TransactionEvidenceStatus = transactionEvidence.Status
-			itemDetail.ShippingStatus = ssr.Status
+			itemDetail.ShippingStatus = ssr.(*APIShipmentStatusRes).Status
 		}
 
 		itemDetails = append(itemDetails, itemDetail)
@@ -1042,7 +1243,7 @@ func getItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	category, err := getCategoryByID(dbx, item.CategoryID)
+	category, err := getCategoryByID(item.CategoryID)
 	if err != nil {
 		outputErrorMsg(w, http.StatusNotFound, "category not found")
 		return
@@ -1289,7 +1490,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 	tx := dbx.MustBegin()
 
 	targetItem := Item{}
-	err = tx.Get(&targetItem, "SELECT * FROM `items` WHERE `id` = ? FOR UPDATE", rb.ItemID)
+	err = tx.Get(&targetItem, "SELECT * FROM `items` WHERE `id` = ?", rb.ItemID)
 	if err == sql.ErrNoRows {
 		outputErrorMsg(w, http.StatusNotFound, "item not found")
 		tx.Rollback()
@@ -1330,7 +1531,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	category, err := getCategoryByID(tx, targetItem.CategoryID)
+	category, err := getCategoryByID(targetItem.CategoryID)
 	if err != nil {
 		log.Print(err)
 
@@ -1928,7 +2129,7 @@ func postSell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	category, err := getCategoryByID(dbx, categoryID)
+	category, err := getCategoryByID(categoryID)
 	if err != nil || category.ParentID == 0 {
 		log.Print(categoryID, category)
 		outputErrorMsg(w, http.StatusBadRequest, "Incorrect category ID")
@@ -2151,16 +2352,7 @@ func getSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ress.PaymentServiceURL = getPaymentServiceURL()
-
-	categories := []Category{}
-
-	err := dbx.Select(&categories, "SELECT * FROM `categories`")
-	if err != nil {
-		log.Print(err)
-		outputErrorMsg(w, http.StatusInternalServerError, "db error")
-		return
-	}
-	ress.Categories = categories
+	ress.Categories = allCategories
 
 	w.Header().Set("Content-Type", "application/json;charset=utf-8")
 	json.NewEncoder(w).Encode(ress)
