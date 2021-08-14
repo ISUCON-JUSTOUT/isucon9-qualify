@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	crand "crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/ioutil"
@@ -12,7 +14,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -21,6 +25,12 @@ import (
 	goji "goji.io"
 	"goji.io/pat"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/go-redis/redis/v7"
+	// "github.com/go-redis/cache/v7"
+
+	_ "net/http/pprof"
 )
 
 const (
@@ -268,6 +278,17 @@ type resSetting struct {
 	Categories        []Category `json:"categories"`
 }
 
+// categoryをin-memoryで管理
+var CategoryByIDMap map[int]Category
+
+// configをin-memoryで管理
+var ConfigByNameMap map[string]Config
+
+// redis cli
+var rcli *redis.Client
+// var rc *cache.Cache
+
+
 func init() {
 	store = sessions.NewCookieStore([]byte("abc"))
 
@@ -279,6 +300,18 @@ func init() {
 }
 
 func main() {
+
+	// pprof
+	runtime.SetBlockProfileRate(1)
+	runtime.SetMutexProfileFraction(1)
+
+	// 基本
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
 	host := os.Getenv("MYSQL_HOST")
 	if host == "" {
 		host = "127.0.0.1"
@@ -319,6 +352,49 @@ func main() {
 	}
 	defer dbx.Close()
 
+	// redis client
+	rcli = redis.NewClient(&redis.Options{
+		Addr: "127.0.0.1:6379",
+		Password: "",
+		DB: 0,
+	})
+	defer rcli.Close()
+
+	// max connections, idle connsの設定
+	// dbx.SetMaxOpenConns(20)
+	// dbx.SetMaxIdleConns(10)
+
+	// categoryをmemoryに載せる
+	var categories []Category
+	err = sqlx.Select(dbx, &categories, "SELECT * FROM `categories`")
+	if err != nil {
+		log.Fatalf("failes to get categories: %s", err.Error())
+	}
+	CategoryByIDMap = make(map[int]Category, len(categories))
+	for _, category := range categories {
+		CategoryByIDMap[category.ID] = category
+	}
+	for _, category := range categories {
+		if category.ParentID == 0 {
+			continue
+		}
+		pc, ok := CategoryByIDMap[category.ParentID]
+		if ok {
+			t := category
+			t.ParentCategoryName = pc.CategoryName
+			CategoryByIDMap[category.ID] = t
+		}
+	}
+
+	// configをmemoryに載せる
+	var configs []Config
+	dbx.Select(&configs, "SELECT * FROM `configs`")
+
+	ConfigByNameMap = make(map[string]Config, len(configs))
+	for _, config := range configs {
+		ConfigByNameMap[config.Name] = config
+	}
+
 	mux := goji.NewMux()
 
 	// API
@@ -355,7 +431,7 @@ func main() {
 	mux.HandleFunc(pat.Get("/users/:user_id"), getIndex)
 	mux.HandleFunc(pat.Get("/users/setting"), getIndex)
 	// Assets
-	mux.Handle(pat.Get("/*"), http.FileServer(http.Dir("../public")))
+	// mux.Handle(pat.Get("/*"), http.FileServer(http.Dir("../public")))
 	log.Fatal(http.ListenAndServe(":8000", mux))
 }
 
@@ -376,14 +452,30 @@ func getCSRFToken(r *http.Request) string {
 	return csrfToken.(string)
 }
 
+// TODO: cache使用できる
+/*
+userを
+SELECT * FROM users WHERE id = ? の結果をキャッシュする
+*/
+
 func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 	session := getSession(r)
 	userID, ok := session.Values["user_id"]
 	if !ok {
 		return user, http.StatusNotFound, "no session"
 	}
+	// TODO: cache使用できる
 
-	err := dbx.Get(&user, "SELECT * FROM `users` WHERE `id` = ?", userID)
+	userStr, err := rcli.Get(fmt.Sprintf("%v", userID)).Result()
+	if err == nil {
+		var user User
+		if err := json.Unmarshal([]byte(userStr), &user); err != nil {
+			panic(err)
+		}
+		return user, http.StatusOK, ""
+	}
+
+	err = dbx.Get(&user, "SELECT * FROM `users` WHERE `id` = ?", userID)
 	if err == sql.ErrNoRows {
 		return user, http.StatusNotFound, "user not found"
 	}
@@ -392,44 +484,68 @@ func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 		return user, http.StatusInternalServerError, "db error"
 	}
 
+	s, err := json.Marshal(user)
+	if err != nil {
+		panic(err)
+	}
+
+	if err := rcli.Set(fmt.Sprintf("%v", userID), string(s), 10 * time.Second).Err(); err != nil {
+		log.Fatalf("failed to set data in redis: %s", err)
+	}
+
 	return user, http.StatusOK, ""
 }
 
 func getUserSimpleByID(q sqlx.Queryer, userID int64) (userSimple UserSimple, err error) {
 	user := User{}
+	// TODO: cache使用できる
+	userStr, err := rcli.Get(fmt.Sprintf("%v", userID)).Result()
+	if err == nil {
+		var user User
+		if err := json.Unmarshal([]byte(userStr), &user); err != nil {
+			panic(err)
+		}
+		userSimple.ID = user.ID
+		userSimple.AccountName = user.AccountName
+		userSimple.NumSellItems = user.NumSellItems
+		return userSimple, nil
+	}
+
 	err = sqlx.Get(q, &user, "SELECT * FROM `users` WHERE `id` = ?", userID)
 	if err != nil {
 		return userSimple, err
 	}
+	
+	s, err := json.Marshal(user)
+	if err != nil {
+		panic(err)
+	}
+
+	if err := rcli.Set(fmt.Sprintf("%v", userID), string(s), 10 * time.Second).Err(); err != nil {
+		log.Fatalf("failed to set data in redis: %s", err)
+	}
+
 	userSimple.ID = user.ID
 	userSimple.AccountName = user.AccountName
 	userSimple.NumSellItems = user.NumSellItems
 	return userSimple, err
 }
 
+// TODO: cache使用できる <- in-memoryでもいいかもしれない
 func getCategoryByID(q sqlx.Queryer, categoryID int) (category Category, err error) {
-	err = sqlx.Get(q, &category, "SELECT * FROM `categories` WHERE `id` = ?", categoryID)
-	if category.ParentID != 0 {
-		parentCategory, err := getCategoryByID(q, category.ParentID)
-		if err != nil {
-			return category, err
-		}
-		category.ParentCategoryName = parentCategory.CategoryName
+	category, ok := CategoryByIDMap[categoryID]
+	if !ok {
+		return category, errors.New("aaaaaa")
 	}
-	return category, err
+	return category, nil
 }
 
 func getConfigByName(name string) (string, error) {
-	config := Config{}
-	err := dbx.Get(&config, "SELECT * FROM `configs` WHERE `name` = ?", name)
-	if err == sql.ErrNoRows {
-		return "", nil
+	config, ok := ConfigByNameMap[name]
+	if !ok {
+		return "", errors.New("config")
 	}
-	if err != nil {
-		log.Print(err)
-		return "", err
-	}
-	return config.Val, err
+	return config.Val, nil
 }
 
 func getPaymentServiceURL() string {
@@ -557,10 +673,30 @@ func getNewItems(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var userIDs []int64
+	for _, item := range items {
+		// TODO: uniqueなら追加するとかできたらする？？
+		userIDs = append(userIDs, item.SellerID)
+	}
+	// {id: user}
+	userIDMap := make(map[int64]UserSimple, len(userIDs))
+	if len(userIDs) > 0 {
+		query, params, _ := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", userIDs)
+		var users []User
+		dbx.Select(&users, query, params...)
+		for _, user := range users {
+			userIDMap[user.ID] = UserSimple{
+				ID:           user.ID,
+				AccountName:  user.AccountName,
+				NumSellItems: user.NumSellItems,
+			}
+		}
+	}
+
 	itemSimples := []ItemSimple{}
 	for _, item := range items {
-		seller, err := getUserSimpleByID(dbx, item.SellerID)
-		if err != nil {
+		seller, ok := userIDMap[item.SellerID]
+		if !ok {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			return
 		}
@@ -613,11 +749,11 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var categoryIDs []int
-	err = dbx.Select(&categoryIDs, "SELECT id FROM `categories` WHERE parent_id=?", rootCategory.ID)
-	if err != nil {
-		log.Print(err)
-		outputErrorMsg(w, http.StatusInternalServerError, "db error")
-		return
+	for _, category := range CategoryByIDMap {
+		c := category
+		if c.ParentID == rootCategory.ID {
+			categoryIDs = append(categoryIDs, c.ID)
+		}
 	}
 
 	query := r.URL.Query()
@@ -645,6 +781,7 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 	var inArgs []interface{}
 	if itemID > 0 && createdAt > 0 {
 		// paging
+		// TODO: ここ改善
 		inQuery, inArgs, err = sqlx.In(
 			"SELECT * FROM `items` WHERE `status` IN (?,?) AND category_id IN (?) AND (`created_at` < ?  OR (`created_at` <= ? AND `id` < ?)) ORDER BY `created_at` DESC, `id` DESC LIMIT ?",
 			ItemStatusOnSale,
@@ -685,15 +822,37 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 売り手のユーザーを検索する, N+1を解決するために, userをInで検索する
+	// categoryを検索する
+	var userIDs []int64
+	for _, item := range items {
+		// TODO: uniqueなら追加するとかできたらする？？
+		userIDs = append(userIDs, item.SellerID)
+	}
+	// {id: user}
+	userIDMap := make(map[int64]UserSimple, len(userIDs))
+	if len(userIDs) > 0 {
+		query, params, _ := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", userIDs)
+		var users []User
+		dbx.Select(&users, query, params...)
+		for _, user := range users {
+			userIDMap[user.ID] = UserSimple{
+				ID:           user.ID,
+				AccountName:  user.AccountName,
+				NumSellItems: user.NumSellItems,
+			}
+		}
+	}
+
 	itemSimples := []ItemSimple{}
 	for _, item := range items {
-		seller, err := getUserSimpleByID(dbx, item.SellerID)
-		if err != nil {
+		seller, ok := userIDMap[item.SellerID]
+		if !ok {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			return
 		}
-		category, err := getCategoryByID(dbx, item.CategoryID)
-		if err != nil {
+		category, ok := CategoryByIDMap[item.CategoryID]
+		if !ok {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			return
 		}
@@ -913,15 +1072,65 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	itemDetails := []ItemDetail{}
+
+	// 売り手のユーザーを検索する, N+1を解決するために, userをInで検索する
+	// categoryを検索する
+	var userIDs []int64
+	var itemIDs []int64
 	for _, item := range items {
-		seller, err := getUserSimpleByID(tx, item.SellerID)
-		if err != nil {
+		// TODO: uniqueなら追加するとかできたらする？？
+		userIDs = append(userIDs, item.SellerID, item.BuyerID)
+		itemIDs = append(itemIDs, item.ID)
+	}
+	// {id: user}
+	userIDMap := make(map[int64]UserSimple, len(userIDs))
+	if len(userIDs) > 0 {
+		query, params, _ := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", userIDs)
+		var users []User
+		tx.Select(&users, query, params...)
+		for _, user := range users {
+			userIDMap[user.ID] = UserSimple{
+				ID:           user.ID,
+				AccountName:  user.AccountName,
+				NumSellItems: user.NumSellItems,
+			}
+		}
+	}
+
+	type Tes struct {
+		ID        int64  `json:"id" db:"id"`
+		ItemID    int64  `json:"item_id" db:"item_id"`
+		Status    string `json:"status" db:"status"`
+		ReserveID string `json:"reserve_id" db:"reserve_id"`
+	}
+
+	tesMap := make(map[int64]Tes, len(itemIDs))
+	if len(itemIDs) > 0 {
+		query, params, _ := sqlx.In("SELECT t1.`id` as `id`, t1.`item_id` as `item_id`, t1.`status` as `status`, s1.`reserve_id` as `reserve_id` FROM `transaction_evidences` as t1 JOIN `shippings` as s1 ON t1.`id` = s1.`transaction_evidence_id` WHERE t1.`item_id` IN (?)", itemIDs)
+		var teses []Tes
+		tx.Select(&teses, query, params...)
+
+		for _, tes := range teses {
+			tesMap[tes.ItemID] = tes
+		}
+	}
+
+	eg, ctx := errgroup.WithContext(context.Background())
+	var mu sync.RWMutex
+	ctx, cancel := context.WithCancel(ctx)
+	ssrMap := make(map[int64]APIShipmentStatusRes)
+
+	for _, item := range items {
+		// 売り手のユーザーを検索する
+		seller, ok := userIDMap[item.SellerID]
+		if !ok {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			tx.Rollback()
 			return
 		}
-		category, err := getCategoryByID(tx, item.CategoryID)
-		if err != nil {
+
+		category, ok := CategoryByIDMap[item.CategoryID]
+		if !ok {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			tx.Rollback()
 			return
@@ -947,8 +1156,8 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if item.BuyerID != 0 {
-			buyer, err := getUserSimpleByID(tx, item.BuyerID)
-			if err != nil {
+			buyer, ok := userIDMap[item.BuyerID]
+			if !ok {
 				outputErrorMsg(w, http.StatusNotFound, "buyer not found")
 				tx.Rollback()
 				return
@@ -957,47 +1166,45 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			itemDetail.Buyer = &buyer
 		}
 
-		transactionEvidence := TransactionEvidence{}
-		err = tx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", item.ID)
-		if err != nil && err != sql.ErrNoRows {
-			// It's able to ignore ErrNoRows
-			log.Print(err)
-			outputErrorMsg(w, http.StatusInternalServerError, "db error")
-			tx.Rollback()
-			return
-		}
-
-		if transactionEvidence.ID > 0 {
-			shipping := Shipping{}
-			err = tx.Get(&shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
-			if err == sql.ErrNoRows {
-				outputErrorMsg(w, http.StatusNotFound, "shipping not found")
-				tx.Rollback()
-				return
-			}
-			if err != nil {
-				log.Print(err)
-				outputErrorMsg(w, http.StatusInternalServerError, "db error")
-				tx.Rollback()
-				return
-			}
-			ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
-				ReserveID: shipping.ReserveID,
+		tes, ok := tesMap[item.ID]
+		itemDetail.TransactionEvidenceID = tes.ID
+		itemDetail.TransactionEvidenceStatus = tes.Status
+		if ok {
+			iid := item.ID
+			rid := tes.ReserveID
+			eg.Go(func() error {
+				select {
+				case <-ctx.Done():
+					return nil
+				default:
+					ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
+						ReserveID: rid,
+					})
+					if err != nil {
+						return err
+					}
+					mu.Lock()
+					defer mu.Unlock()
+					ssrMap[iid] = *ssr
+					return nil
+				}
 			})
-			if err != nil {
-				log.Print(err)
-				outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
-				tx.Rollback()
-				return
-			}
-
-			itemDetail.TransactionEvidenceID = transactionEvidence.ID
-			itemDetail.TransactionEvidenceStatus = transactionEvidence.Status
-			itemDetail.ShippingStatus = ssr.Status
 		}
-
 		itemDetails = append(itemDetails, itemDetail)
 	}
+
+	if err := eg.Wait(); err != nil {
+		log.Print(err)
+		cancel()
+		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
+		tx.Rollback()
+		return
+	}
+
+	for i, item := range itemDetails {
+		itemDetails[i].ShippingStatus = ssrMap[item.ID].Status
+	}
+
 	tx.Commit()
 
 	hasNext := false
@@ -1280,7 +1487,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	buyer, errCode, errMsg := getUser(r)
+	buyer, errCode, errMsg := getUser(r) // TODO: 中身の改善
 	if errMsg != "" {
 		outputErrorMsg(w, errCode, errMsg)
 		return
@@ -1381,29 +1588,49 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	scr, err := APIShipmentCreate(getShipmentServiceURL(), &APIShipmentCreateReq{
-		ToAddress:   buyer.Address,
-		ToName:      buyer.AccountName,
-		FromAddress: seller.Address,
-		FromName:    seller.AccountName,
+	eg, ctx := errgroup.WithContext(context.Background())
+
+	var scr *APIShipmentCreateRes
+	eg.Go(func() error {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			scr, err = APIShipmentCreate(getShipmentServiceURL(), &APIShipmentCreateReq{
+				ToAddress:   buyer.Address,
+				ToName:      buyer.AccountName,
+				FromAddress: seller.Address,
+				FromName:    seller.AccountName,
+			})
+
+			if err != nil {
+				return err
+			}
+			return nil
+		}
 	})
-	if err != nil {
-		log.Print(err)
-		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
-		tx.Rollback()
 
-		return
-	}
-
-	pstr, err := APIPaymentToken(getPaymentServiceURL(), &APIPaymentServiceTokenReq{
-		ShopID: PaymentServiceIsucariShopID,
-		Token:  rb.Token,
-		APIKey: PaymentServiceIsucariAPIKey,
-		Price:  targetItem.Price,
+	var pstr *APIPaymentServiceTokenRes
+	eg.Go(func() error {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			pstr, err = APIPaymentToken(getPaymentServiceURL(), &APIPaymentServiceTokenReq{
+				ShopID: PaymentServiceIsucariShopID,
+				Token:  rb.Token,
+				APIKey: PaymentServiceIsucariAPIKey,
+				Price:  targetItem.Price,
+			})
+			if err != nil {
+				return err
+			}
+			return nil
+		}
 	})
-	if err != nil {
-		log.Print(err)
 
+	if err := eg.Wait(); err != nil {
+		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "payment service is failed")
 		tx.Rollback()
 		return
@@ -1582,6 +1809,7 @@ func postShip(w http.ResponseWriter, r *http.Request) {
 		Path:      fmt.Sprintf("/transactions/%d.png", transactionEvidence.ID),
 		ReserveID: shipping.ReserveID,
 	}
+	w.Header().Set("Content-Type", "application/json;charset=utf-8")
 	json.NewEncoder(w).Encode(rps)
 }
 
@@ -2021,6 +2249,17 @@ func postSell(w http.ResponseWriter, r *http.Request) {
 	}
 	tx.Commit()
 
+	seller.NumSellItems += 1
+	seller.LastBump = now
+	s, err := json.Marshal(seller)
+	if err != nil {
+		panic(err)
+	}
+
+	if err := rcli.Set(fmt.Sprintf("%v", seller.ID), string(s), 10 * time.Second).Err(); err != nil {
+		log.Fatalf("failed to set data in redis: %s", err)
+	}
+
 	w.Header().Set("Content-Type", "application/json;charset=utf-8")
 	json.NewEncoder(w).Encode(resSell{ID: itemID})
 }
@@ -2129,6 +2368,17 @@ func postBump(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tx.Commit()
+
+	seller.LastBump = now
+	s, err := json.Marshal(seller)
+	if err != nil {
+		panic(err)
+	}
+
+	if err := rcli.Set(fmt.Sprintf("%v", seller.ID), string(s), 10 * time.Second).Err(); err != nil {
+		log.Fatalf("failed to set data in redis: %s", err)
+	}
+
 
 	w.Header().Set("Content-Type", "application/json;charset=utf-8")
 	json.NewEncoder(w).Encode(&resItemEdit{
